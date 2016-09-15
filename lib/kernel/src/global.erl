@@ -58,14 +58,13 @@
 %%% In certain places in the server, calling io:format hangs everything,
 %%% so we'd better use erlang:display/1.
 %%% my_tracer is used in testsuites
--define(trace(_), ok).
+% -define(trace(_), ok).
+-define(trace(T), erlang:display({format, node(), cs(), T})).
+cs() ->
+   {_Big, Small, Tiny} = erlang:timestamp(),
+   (Small rem 100) * 100 + (Tiny div 10000).
 
 %-define(trace(T), (catch my_tracer ! {node(), {line,?LINE}, T})).
-
-%-define(trace(T), erlang:display({format, node(), cs(), T})).
-%cs() ->
-%    {_Big, Small, Tiny} = now(),
-%    (Small rem 100) * 100 + (Tiny div 10000).
 
 %% These are the protocol versions:
 %% Vsn 1 is the original protocol.
