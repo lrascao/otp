@@ -21,18 +21,27 @@
 
 -behaviour(gen_server).
 
+-define(DEBUG, true).
 -ifdef(DEBUG).
 -define(port_please_failure(), io:format("Net Kernel 2: EPMD port please failed at ~p:~p~n", [?MODULE,?LINE])).
 -define(port_please_failure2(Term), io:format("Net Kernel 2: EPMD port please failed at ~p:~p [~p]~n", [?MODULE,?LINE,Term])).
+-define(handover_failure(), io:format("Net Kernel 2: EPMD handover failed at ~p:~p~n", [?MODULE,?LINE])).
+-define(handover_failure2(Term), io:format("Net Kernel 2: EPMD handover failed at ~p:~p [~p]~n", [?MODULE,?LINE,Term])).
 -else.
 -define(port_please_failure(), noop).
 -define(port_please_failure2(Term), noop).
+-define(handover_failure(), noop).
+-define(handover_failure2(Term), noop).
 -endif.
 
 %% External exports
 -export([start/0, start_link/0, stop/0, port_please/2, 
 	 port_please/3, names/0, names/1,
-	 register_node/2, register_node/3, open/0, open/1, open/2]).
+	 register_node/2, register_node/3, open/0, open/1, open/2,
+     handover/2]).
+
+%% internal exports
+-export([recv_fd_loop/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, 
@@ -110,6 +119,24 @@ register_node(Name, PortNo, inet6_tcp) ->
 register_node(Name, PortNo, Family) ->
     gen_server:call(erl_epmd, {register, Name, PortNo, Family}, infinity).
 
+handover(Node, Host) ->
+  handover(Node, Host, infinity).
+
+handover(Node, HostName, Timeout) when is_atom(HostName) ->
+  handover1(Node, atom_to_list(HostName), Timeout);
+handover(Node, HostName, Timeout) when is_list(HostName) ->
+  handover1(Node, HostName, Timeout);
+handover(Node, EpmdAddr, Timeout) ->
+  epmd_handover(Node, EpmdAddr, Timeout).
+
+handover1(Node, HostName, Timeout) ->
+  case inet:gethostbyname(HostName, inet, Timeout) of
+    {ok,{hostent, _Name, _ , _Af, _Size, [EpmdAddr | _]}} ->
+      epmd_handover(Node, EpmdAddr, Timeout);
+    Else ->
+      Else
+  end.
+
 %%%----------------------------------------------------------------------
 %%% Callback functions from gen_server
 %%%----------------------------------------------------------------------
@@ -131,6 +158,9 @@ handle_call({register, Name, PortNo, Family}, _From, State) ->
 	P when P < 0 ->
 	    case do_register_node(Name, PortNo, Family) of
 		{alive, Socket, Creation} ->
+            %% after registering the node with epmd handle anything
+            %% that arrives in the node socket as messages
+            inet:setopts(Socket, [{active, true}, {packet, 2}]),
 		    S = State#state{socket = Socket,
 				    port_no = PortNo,
 				    name = Name},
@@ -153,6 +183,22 @@ handle_call(stop, _From, State) ->
 
 -spec handle_cast(term(), state()) -> {'noreply', state()}.
 
+handle_cast({handover, {error, _Error}}, State) ->
+    {noreply, State};
+handle_cast({handover, {ok, SocketFd}}, State) ->
+    %% we now receive a handover socket descriptor, now make it into
+    %% an erlang socket
+    {ok, Socket} = inet_tcp:fdopen(SocketFd, []),
+    %% send back a success reply to the remote node's erl_epmd
+    Msg = [?EPMD_HANDOVER_RESP, 0, ?int16(42)],
+    ok = gen_tcp:send(Socket, Msg),
+    %% set the socket as passive raw
+    inet:setopts(Socket, [{active, false}, {packet, raw}]),
+    %% now give this socket to net_kernel since it has now become the
+    %% connection between nodes
+    ok = gen_tcp:controlling_process(Socket, whereis(net_kernel)),
+    whereis(net_kernel) ! {handover, self(), Socket, inet, tcp},
+    {noreply, State};
 handle_cast(_, State) ->
     {noreply, State}.
 
@@ -160,6 +206,27 @@ handle_cast(_, State) ->
 
 -spec handle_info(term(), state()) -> {'noreply', state()}.
 
+handle_info({tcp, Socket, [?EPMD_HANDOVER_REQ]}, State) when State#state.socket =:= Socket ->
+    %% start listening for socket descriptors
+    SocketPath = io_lib:format("~s~s~s", [?HANDOVER_SOCKET_PREFIX,
+                                          pid_to_list(self()),
+                                          ?HANDOVER_SOCKET_SUFFIX]),
+    %% ensure that the socket path doesn't exist
+    _ = file:delete(SocketPath),
+    {ok, Port} = gen_tcp:listen(0, [{ifaddr, {local, SocketPath}}, local,
+                                    {active, false}]),
+    %% spawn another process that will wait in a receive loop for a socket descriptor
+    %% to be passed
+    Pid = spawn(?MODULE, recv_fd_loop, [self(), Port]),
+    %% set the newly spawned worker as the controlling process for the
+    %% unix socket
+    ok = gen_udp:controlling_process(Port, Pid),
+    %% now inform it that he's in control
+    Pid ! {controlling, Port},
+    %% send unix socket path we are listening on to epmd, it will hand over the remote node
+    %% connection through it
+    ok = gen_tcp:send(Socket, SocketPath),
+    {noreply, State};
 handle_info({tcp_closed, Socket}, State) when State#state.socket =:= Socket ->
     {noreply, State#state{socket = -1}};
 handle_info(_, State) ->
@@ -185,6 +252,27 @@ code_change(_OldVsn, State, _Extra) ->
 %%%----------------------------------------------------------------------
 %%% Internal functions
 %%%----------------------------------------------------------------------
+
+recv_fd_loop(Parent, Port0) ->
+    receive
+        {controlling, Port0} ->
+            %% accept a new connection, now that we are in control
+            %% the accept will block
+            {ok, Port} = gen_tcp:accept(Port0),
+            %% be a good erlang citizen and send a message
+            %% to ourselves stating that the accept is done
+            self() ! {accepted, Port},
+            recv_fd_loop(Parent, Port);
+        {accepted, Port} ->
+            %% block on the recv and get a socket descriptor
+            %% sent by epmd
+            case local_tcp:recv_fd(Port) of
+                {ok, Fd} ->
+                    gen_server:cast(Parent, {handover, {ok, Fd}});
+                {error, Error} ->
+                    gen_server:cast(Parent, {handover, {error, Error}})
+            end
+    end.
 
 get_epmd_port() ->
     case init:get_argument(epmd_port) of
@@ -323,7 +411,6 @@ get_port(Node, EpmdAddress, Timeout) ->
 wait_for_port_reply(Socket, SoFar) ->
     receive
 	{tcp, Socket, Data0} ->
-%	    io:format("got ~p~n", [Data0]),
 	    case SoFar ++ Data0 of
 		[$w, Result | Rest] ->
 		    case Result of
@@ -380,21 +467,101 @@ wait_for_port_reply_cont2(Socket, Data) ->
     Low = ?u16(LowA, LowB),
     High = ?u16(HighA, HighB),
     Version = best_version(Low, High),
-%    io:format("Returning ~p~n", [{port, ?u16(A, B), Version}]),
     {port, ?u16(A, B), Version}.
-%    {port, ?u16(A, B)}.
 
 %%% Throw away the rest of the message; we won't use any of it anyway,
 %%% currently.
 wait_for_port_reply_name(Socket, Len, Sofar) ->
     receive
 	{tcp, Socket, _Data} ->
-%	    io:format("data = ~p~n", _Data),
 	    wait_for_port_reply_name(Socket, Len, Sofar);
 	{tcp_closed, Socket} ->
 	    ok
     end.
-		    
+
+%%
+%%% connect to a remote epmd and request it to perform
+%%% an handover of the current connection to the requested
+%%% node
+%%
+
+epmd_handover(Node, EpmdAddress, Timeout) ->
+    case open(EpmdAddress, Timeout) of
+    {ok, Socket} ->
+        Name = to_string(Node),
+        %% the extra byte is the ?EPMD_HANDOVER_REQ
+        Len = 1+length(Name),
+        Msg = [?int16(Len),?EPMD_HANDOVER_REQ,Name],
+        case gen_tcp:send(Socket, Msg) of
+        ok ->
+            wait_for_handover_reply(Socket, []);
+        _Error ->
+            ?handover_failure2(_Error),
+            error
+        end;
+    _Error ->
+        ?handover_failure2(_Error),
+        error
+    end.
+
+wait_for_handover_reply(Socket, SoFar) ->
+    receive
+    {tcp, Socket, Data0} ->
+        case SoFar ++ Data0 of
+        [?EPMD_HANDOVER_RESP, Result | Rest] ->
+            case Result of
+            0 ->
+                wait_for_handover_reply_cont(Socket, Rest);
+            _ ->
+                ?handover_failure(),
+                wait_for_close(Socket, handover_failed)
+            end;
+        Data when length(Data) < 2 ->
+            wait_for_handover_reply(Socket, Data);
+        Garbage ->
+            ?handover_failure(),
+            {error, {garbage_from_epmd, Garbage}}
+        end;
+    {tcp_closed, Socket} ->
+        ?handover_failure(),
+        closed
+    after 10000 ->
+        ?handover_failure(),
+        gen_tcp:close(Socket),
+        handover_failed
+    end.
+
+wait_for_handover_reply_cont(Socket, SoFar) when length(SoFar) >= 2 ->
+    wait_for_handover_reply_cont2(Socket, SoFar);
+wait_for_handover_reply_cont(Socket, SoFar) ->
+    receive
+    {tcp, Socket, Data0} ->
+        case SoFar ++ Data0 of
+        Data when length(Data) >= 2 ->
+            wait_for_handover_reply_cont2(Socket, Data);
+        Data when length(Data) < 2 ->
+            wait_for_handover_reply_cont2(Socket, Data);
+        Garbage ->
+            ?handover_failure(),
+            {error, {garbage_from_epmd, Garbage}}
+        end;
+    {tcp_closed, Socket} ->
+        ?handover_failure(),
+        handover_failed
+    after 10000 ->
+        ?handover_failure(),
+        gen_tcp:close(Socket),
+        handover_failed
+    end.
+
+wait_for_handover_reply_cont2(Socket, Data) ->
+    [VA, VB] = Data,
+    Version = ?u16(VA, VB),
+    %% after receiving the handover reply set the socket
+    %% as passive since this is the way it was expected
+    %% using the port please method
+    inet:setopts(Socket, [{active, false}]),
+    {ok, Socket, Version}.
 
 best_version(Low, High) ->
     OurLow =  epmd_dist_low(),

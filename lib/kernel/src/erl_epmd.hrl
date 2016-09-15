@@ -23,8 +23,14 @@
 -define(EPMD_ALIVE2_RESP, $y).
 -define(EPMD_PORT2_RESP, $w).
 -define(EPMD_NAMES, $n).
+-define(EPMD_HANDOVER_REQ, $h).
+-define(EPMD_HANDOVER_RESP, $i).
 
 %% Commands used only by interactive client
 -define(EPMD_DUMP, $d).
 -define(EPMD_KILL, $k).
 -define(EPMD_STOP, $s).
+
+%% Handover constants
+-define(HANDOVER_SOCKET_PREFIX, "/tmp/erlang.handover.").
+-define(HANDOVER_SOCKET_SUFFIX, ".sock").

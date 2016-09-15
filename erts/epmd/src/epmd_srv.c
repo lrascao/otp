@@ -524,6 +524,31 @@ void run(EpmdVars *g)
 }
 
 /*
+ * read the requested amount of data from a socket, wait the maximum
+ * amount of time specified
+ */
+static int read_to(int fd, char *buf, int len, int timeout)
+{
+  fd_set read_mask;
+  struct timeval to;
+  int ret;
+
+  to.tv_sec = timeout;
+  to.tv_usec = 0;
+  FD_SET(fd, &read_mask);
+
+  /* instruct select to warns when either data arrives or the timeout expires */
+  ret = select(fd + 1, &read_mask, (fd_set *)0, (fd_set *)0, &to);
+  /* timeout or error, return either way */
+  if (ret <= 0) {
+    return ret;
+  }
+
+  /* if we get here then there's something to read, do it */
+  return read(fd, buf, len);
+}
+
+/*
  *  This routine read as much of the packet as possible and
  *  if completed calls "do_request()" to fullfill the request.
  *
@@ -994,6 +1019,173 @@ static void do_request(g, fd, s, buf, bsize)
 	    return;
 	  }
 	dbg_tty_printf(g,1,"** sent STOP_RESP STOPPED");
+      }
+      break;
+
+    case EPMD_HANDOVER_REQ:
+      dbg_printf(g,1,"** got EPMD_HANDOVER_REQ on socket %d", fd);
+
+      if (buf[bsize - 1] == '\000') /* Skip null termination */
+	bsize--;
+
+      if (bsize <= 1)
+	{
+	  dbg_printf(g,0,"packet too small for request HANDOVER_REQ (%d)", bsize);
+	  return;
+	}
+
+      for (i = 1; i < bsize; i++)
+	if (buf[i] == '\000')
+	  {
+	    dbg_printf(g,0,"node name contains ascii 0 in HANDOVER_REQ");
+	    return;
+	  }
+
+      {
+	char *name = &buf[1]; /* Points to node name */
+	int nsz;
+	Node *node;
+
+	nsz = verify_utf8(name, bsize, 0);
+	if (nsz < 1 || 255 < nsz) {
+	  dbg_printf(g,0,"invalid node name in HANDOVER_REQ");
+	  return;
+	}
+
+	for (node = g->nodes.reg; node; node = node->next) {
+	  int offset = 0, opt = 0;
+	  unsigned short payload_len = 0;
+	  char *unix_socket_path;
+	  /* connection handover is only available for the tcp protocol */
+	  if (node->protocol == 0 && is_same_str(node->symname, name)) {
+	    /* create a duplicate of the current socket connection and send
+	       it to the target node so it can be re-created there
+	    */
+	    dbg_tty_printf(g,1,"handing over connection to \"%s\"(%hu)",name,node->port);
+	    /* the handover request to the node is only byte */
+	    put_int16(1, wbuf);
+	    offset = 2;
+	    wbuf[offset] = EPMD_HANDOVER_REQ;
+	    offset += 1;
+	    reply(g, node->fd, wbuf, offset);
+
+	    /* Receive the handover reply from the target node
+	       with the unix socket path to connect to.
+	       first read two bytes with the size of the payload then
+	       the payload itself
+	    */
+	    opt = fcntl(node->fd, F_GETFL, 0);
+	    if (fcntl(node->fd, F_SETFL, opt & ~O_NONBLOCK) == -1) {
+	      dbg_tty_printf(g,1,"failed to set socket %d as blocking(%hu)",
+			     node->fd,node->port);
+	    }
+	    dbg_tty_printf(g,1,"now waiting for handover request reply(%hu)",node->port);
+	    if (read_to(node->fd, (char *) &payload_len,
+			sizeof(payload_len), HANDOVER_REPLY_TIMEOUT) != sizeof(payload_len)) {
+	      dbg_tty_printf(g,1,"failed to read %hu bytes from socket %d(%hu), closing",
+			       sizeof(payload_len),node->fd,node->port);
+	      node_unreg_sock(g,node->fd);
+	      conn_close_fd(g,node->fd);
+	      return;
+	    }
+	    payload_len = ntohs(payload_len);
+	    if (payload_len == 0) {
+	      dbg_tty_printf(g,1,"failed to read payload length from socket %d(%hu), closing",
+			     node->fd,node->port);
+	      node_unreg_sock(g,node->fd);
+	      conn_close_fd(g, node->fd);
+	      return;
+	    }
+	    dbg_tty_printf(g,1,"reading handover reply, payload len: %hu (%hu)",
+			   payload_len, node->port);
+	    unix_socket_path = (char *)malloc(payload_len + 1);
+	    if (read_to(node->fd, unix_socket_path, payload_len,
+			HANDOVER_REPLY_TIMEOUT) != payload_len) {
+	      dbg_tty_printf(g,1,"failed to read %hu bytes from socket %d(%hu), closing",
+			     payload_len,node->fd,node->port);
+	      node_unreg_sock(g,node->fd);
+	      conn_close_fd(g, node->fd);
+	      return;
+	    }
+
+      unix_socket_path[payload_len] = '\0';
+	    dbg_tty_printf(g,1,"handing over connection over unix socket \"%s\"(%hu)",
+			   unix_socket_path,node->port);
+
+	    /* now send the remote node socket descriptor to the target node */
+	    {
+	      struct msghdr message;
+	      struct iovec iov[1];
+	      struct cmsghdr *control_message = NULL;
+	      int *scm_rights_ptr = NULL;
+	      char ctrl_buf[CMSG_SPACE(sizeof(int))];
+	      char data[1];
+	      struct sockaddr_un addr;
+	      int s;
+
+	      s = socket(AF_UNIX, SOCK_STREAM, 0);
+
+	      memset(&addr, 0, sizeof(addr));
+	      addr.sun_family = AF_UNIX;
+	      strcpy(addr.sun_path, unix_socket_path);
+
+	      if (connect(s,(struct sockaddr *) &(addr),
+			  sizeof(addr)) < 0) {
+		dbg_tty_printf(g,1,"failed to connect to unix socket \"%s\"(%hu) (error: %d)",
+			       unix_socket_path,node->port,errno);
+    close(s);
+		return;
+	      }
+	      memset(&message, 0, sizeof(struct msghdr));
+	      memset(ctrl_buf, 0, CMSG_SPACE(sizeof(int)));
+
+	      // We are passing at least one byte of data so that recvmsg() will not return 0
+	      data[0] = ' ';
+	      iov[0].iov_base = data;
+	      iov[0].iov_len = sizeof(data);
+
+	      message.msg_name = NULL;
+	      message.msg_namelen = 0;
+	      message.msg_iov = iov;
+	      message.msg_iovlen = 1;
+	      message.msg_controllen =  CMSG_SPACE(sizeof(int));
+	      message.msg_control = ctrl_buf;
+
+	      control_message = CMSG_FIRSTHDR(&message);
+	      control_message->cmsg_level = SOL_SOCKET;
+	      control_message->cmsg_type = SCM_RIGHTS;
+	      control_message->cmsg_len = CMSG_LEN(sizeof(int));
+
+	      scm_rights_ptr = (int *) CMSG_DATA(control_message);
+	      memcpy(scm_rights_ptr, &fd, sizeof(int));
+
+	      sendmsg(s, &message, 0);
+        /* Also the unix socket is no longer needed, so close it also */
+        close(s);
+
+        dbg_tty_printf(g,1,"connection handed over unix socket \"%s\"(%hu)",
+          unix_socket_path,node->port);
+	    }
+	    free(unix_socket_path);
+
+	    /* from this point the current connection has been handed over
+	       to the remote node, so any reply will arrive from it, our work
+	       here is done, we can close the connection since it's been handed
+	       over
+	    */
+	    close(fd);
+
+	    return;
+	  }
+	}
+	wbuf[1] = 1; /* error */
+	if (reply(g, fd, wbuf, 2) != 2)
+	  {
+	    dbg_tty_printf(g,1,"** failed to send HANDOVER_RESP (error) for \"%s\"",name);
+	    return;
+	  }
+	dbg_tty_printf(g,1,"** sent HANDOVER_RESP (error) for \"%s\"",name);
+	return;
       }
       break;
 

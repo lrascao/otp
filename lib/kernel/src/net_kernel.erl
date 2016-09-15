@@ -655,6 +655,27 @@ handle_info({accept,AcceptPid,Socket,Family,Proto}, State) ->
     end;
 
 %%
+%% a new connection has been handed over from epmd.
+%%
+handle_info({handover, _EpmdPid, Socket, Family, Proto}, State) ->
+    MyNode = State#state.node,
+    ?debug({net_kernel, tcp_handover, Socket, erl_epmd, EpmdPid}),
+    case get_proto_mod(Family,Proto,State#state.listen) of
+    {ok, Mod} ->
+        Pid = Mod:accept_connection(self(),
+                    Socket,
+                    MyNode,
+                    State#state.allowed,
+                    State#state.connecttime),
+        ok = gen_tcp:controlling_process(Socket, Pid),
+        Pid ! {self(), controller},
+        ?debug({net_kernel, Pid, controller_of_socket, Socket}),
+        {noreply,State};
+    _ ->
+        {noreply, State}
+    end;
+
+%%
 %% A node has successfully been connected.
 %%
 handle_info({SetupPid, {nodeup,Node,Address,Type,Immediate}},
@@ -1191,6 +1212,7 @@ setup(Node,Type,From,State) ->
 	_ ->
 	    case select_mod(Node, State#state.listen) of
 		{ok, L} ->
+            ?debug({net_kernel, setup, State#state.node, Node}),
 		    Mod = L#listen.module,
 		    LAddr = L#listen.address,
 		    MyNode = State#state.node,

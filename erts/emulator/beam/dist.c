@@ -2852,6 +2852,64 @@ BIF_RETTYPE setnode_3(BIF_ALIST_3)
     goto done;
 }
 
+/**********************************************************************
+ **
+ ***********************************************************************/
+
+BIF_RETTYPE setnodealias_3(BIF_ALIST_3)
+{
+    BIF_RETTYPE ret;
+    DistEntry *dep = NULL;
+    ErlNode *node = NULL;
+
+    /* Prepare for success */
+    ERTS_BIF_PREP_RET(ret, am_true);
+
+    /*
+     * Check and pick out arguments
+     */
+
+    if (!is_node_name_atom(BIF_ARG_1) ||
+    !is_node_name_atom(BIF_ARG_2) ||
+    is_not_pid(BIF_ARG_3) ||
+    (erts_this_node->sysname == am_Noname)) {
+    goto badarg;
+    }
+
+    /*
+     * Arguments seem to be in order.
+     */
+
+    erts_fprintf(stderr, "setnodealias_3(%T, %T, %T)\n", BIF_ARG_1, BIF_ARG_2, BIF_ARG_3);
+
+    /* get dist_entry */
+    dep = erts_find_or_insert_dist_entry(BIF_ARG_1);
+    if (dep == erts_this_dist_entry)
+    goto badarg;
+    else if (!dep)
+    goto system_limit; /* Should never happen!!! */
+    erts_smp_de_rlock(dep);
+
+    node = pid_node(BIF_ARG_3);
+    node->dist_entry = dep;
+
+ done:
+
+    if (dep && dep != erts_this_dist_entry) {
+    erts_smp_de_runlock(dep);
+    erts_deref_dist_entry(dep);
+    }
+
+    return ret;
+
+ badarg:
+    ERTS_BIF_PREP_ERROR(ret, BIF_P, BADARG);
+    goto done;
+
+ system_limit:
+    ERTS_BIF_PREP_ERROR(ret, BIF_P, SYSTEM_LIMIT);
+    goto done;
+}
 
 /**********************************************************************/
 /* dist_exit(Local, Term, Remote) -> Bool */

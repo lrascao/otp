@@ -528,22 +528,26 @@ con_loop({Kernel, Node, Socket, Type, MFTick, MFGetstat, MFSetOpts, MFGetOpts}=C
 %% Misc. functions.
 %% ------------------------------------------------------------
 
-send_name(#hs_data{socket = Socket, this_node = Node, 
+send_name(#hs_data{socket = Socket,
+           other_node = OtherNode,
+           this_node = Node, 
 		   f_send = FSend, 
 		   this_flags = Flags,
 		   other_version = Version}) ->
-    ?trace("send_name: node=~w, version=~w\n",
-	   [Node,Version]),
+    ?trace("send_name: node=~w, version=~w, other node=~p\n",
+	   [Node,Version,OtherNode]),
     ?to_port(FSend, Socket, 
 	     [$n, ?int16(Version), ?int32(Flags), atom_to_list(Node)]).
 
-send_challenge(#hs_data{socket = Socket, this_node = Node, 
+send_challenge(#hs_data{socket = Socket,
+            other_node = OtherNode,
+            this_node = Node, 
 			other_version = Version, 
 			this_flags = Flags,
 			f_send = FSend},
 	       Challenge ) ->
-    ?trace("send: challenge=~w version=~w\n",
-	   [Challenge,Version]),
+    ?trace("send: challenge=~w version=~w, other node=~p\n",
+	   [Challenge,Version,OtherNode]),
     ?to_port(FSend, Socket, [$n,?int16(Version), ?int32(Flags),
 			     ?int32(Challenge), 
 			     atom_to_list(Node)]).
@@ -591,15 +595,32 @@ publish_type(Flags) ->
 
 %% wait for challenge after connect
 recv_challenge(#hs_data{socket=Socket,other_node=Node,
-			other_version=Version,f_recv=Recv}) ->
+			other_version=Version,f_recv=Recv,
+            connection_method = ConnectionMethod}) ->
     case Recv(Socket, 0, infinity) of
 	{ok,[$n,V1,V0,Fl1,Fl2,Fl3,Fl4,CA3,CA2,CA1,CA0 | Ns]} ->
 	    Flags = ?u32(Fl1,Fl2,Fl3,Fl4),
-	    try {list_to_existing_atom(Ns),?u16(V1,V0)} of
-		{Node,Version} ->
+	    try {list_to_atom(Ns),?u16(V1,V0)} of
+        {Node,Version} ->
+            Challenge = ?u32(CA3,CA2,CA1,CA0),
+            ?trace("recv: node=~w, challenge=~w version=~w\n",
+               [Node, Challenge,Version]),
+            {Flags,Challenge};
+        %% this is not right, we actually need a tuple containing
+        %% the node that we are expecting, something like:
+        %%  {{Node, NodeAlias}, Version}
+		{NodeAlias,Version} when ConnectionMethod =:= handover ->
+            %% the remote node answered us with a different node name
+            %% since we're using handover as the connection method this is
+            %% expected, (ie. connecting to a public address or load balancer,
+            %% the node will be reporting it's private address)
+            %% for this reason we must register this alias with global_name_server
+            %% so that he receives a init_connect request to the alias he can
+            %% translate it to the actual public address node
+            global:register_node_alias(NodeAlias, Node),
 		    Challenge = ?u32(CA3,CA2,CA1,CA0),
-		    ?trace("recv: node=~w, challenge=~w version=~w\n",
-			   [Node, Challenge,Version]),
+		    ?trace("recv: node alias =~w, challenge=~w version=~w, ~p\n",
+			   [NodeAlias, Challenge,Version, erlang:system_info(dist)]),
 		    {Flags,Challenge};
 		_ ->
 		    ?shutdown2(no_node, {recv_challenge_failed, no_node, Ns})

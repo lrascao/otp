@@ -279,6 +279,30 @@ gen_setup(Driver, Node, Type, MyNode, LongOrShortNames, SetupTime) ->
 	      [Driver, self(), Node, Type, MyNode, LongOrShortNames, SetupTime],
 	      [link, {priority, max}]).
 
+node_connect(port_please, Name, Ip, Timer) ->
+    case erl_epmd:port_please(Name, Ip) of
+        {port, TcpPort, Version} ->
+            ?trace("port_please(~p:~p) -> version ~p~n",
+               [Name,Ip,Version]),
+            dist_util:reset_timer(Timer),
+            case inet_tcp:connect(Ip, TcpPort,
+                    connect_options([{active, false}, {packet, 2}])) of
+                {ok, Socket} ->
+                    {ok, Socket, TcpPort, Version};
+                _ -> {error, connect}
+            end;
+        _ -> {error, port_please}
+    end;
+node_connect(handover, Name, Ip, Timer) ->
+    dist_util:reset_timer(Timer),
+    case erl_epmd:handover(Name, Ip) of
+        {ok, Socket, Version} ->
+            ?trace("handover(~p,~p) -> version ~p~n",
+               [Name,Ip,Version]),
+            {ok, Socket, undefined, Version};
+        Else -> Else
+    end.
+
 do_setup(Driver, Kernel, Node, Type, MyNode, LongOrShortNames, SetupTime) ->
     ?trace("~p~n",[{inet_tcp_dist,self(),setup,Node}]),
     [Name, Address] = splitnode(Driver, Node, LongOrShortNames),
@@ -286,18 +310,12 @@ do_setup(Driver, Kernel, Node, Type, MyNode, LongOrShortNames, SetupTime) ->
     case inet:getaddr(Address, AddressFamily) of
 	{ok, Ip} ->
 	    Timer = dist_util:start_timer(SetupTime),
-	    ErlEpmd = net_kernel:epmd_module(),
-	    case ErlEpmd:port_please(Name, Ip) of
-		{port, TcpPort, Version} ->
-		    ?trace("port_please(~p) -> version ~p~n", 
-			   [Node,Version]),
-		    dist_util:reset_timer(Timer),
-		    case
-			Driver:connect(
-			  Ip, TcpPort,
-			  connect_options([{active, false}, {packet, 2}]))
-		    of
-			{ok, Socket} ->
+        ErlEpmd = net_kernel:epmd_module(),
+        %% TODO - set this as an option somehow
+        ConnectionMethod = handover,
+        % ConnectionMethod = port_please,
+	    case node_connect(ConnectionMethod, Name, Ip, Timer) of
+			{ok, Socket, TcpPort, Version} ->
 			    HSData = #hs_data{
 			      kernel_pid = Kernel,
 			      other_node = Node,
@@ -339,21 +357,15 @@ do_setup(Driver, Kernel, Node, Type, MyNode, LongOrShortNames, SetupTime) ->
 			      mf_getstat = fun ?MODULE:getstat/1,
 			      request_type = Type,
 			      mf_setopts = fun ?MODULE:setopts/2,
-			      mf_getopts = fun ?MODULE:getopts/2
+			      mf_getopts = fun ?MODULE:getopts/2,
+                  connection_method = ConnectionMethod
 			     },
 			    dist_util:handshake_we_started(HSData);
-			_ ->
-			    %% Other Node may have closed since 
-			    %% port_please !
-			    ?trace("other node (~p) "
-				   "closed since port_please.~n", 
-				   [Node]),
-			    ?shutdown(Node)
-		    end;
-		_ ->
-		    ?trace("port_please (~p) "
-			   "failed.~n", [Node]),
-		    ?shutdown(Node)
+    		_ ->
+                %% Other Node may have closed since
+    		    ?trace("node connect (~p) "
+    			   "failed.~n", [Node]),
+    		    ?shutdown(Node)
 	    end;
 	_Other ->
 	    ?trace("inet_getaddr(~p) "

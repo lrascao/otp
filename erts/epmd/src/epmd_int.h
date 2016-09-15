@@ -84,6 +84,7 @@
 #  include <netinet/in.h>
 #  include <sys/socket.h>
 #  include <sys/stat.h>
+#  include <sys/un.h>
 
 #  ifdef DEF_INADDR_LOOPBACK_IN_RPC_TYPES_H
 #    include <rpc/types.h>
@@ -242,6 +243,7 @@ static const struct in6_addr in6addr_loopback =
 
 #define IDLE_TIMEOUT 5
 #define CLOSE_TIMEOUT 60
+#define HANDOVER_REPLY_TIMEOUT 5
 
 /* We save the name of nodes that are unregistered. If a new
    node register the name we want to increment the "creation",

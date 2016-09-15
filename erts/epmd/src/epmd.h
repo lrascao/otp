@@ -28,6 +28,8 @@
 #define EPMD_ALIVE2_RESP 'y'
 #define EPMD_PORT2_RESP 'w'
 #define EPMD_NAMES_REQ 'n'
+#define EPMD_HANDOVER_REQ  'h'
+#define EPMD_HANDOVER_RESP 'i'
 
 /* Interactive client command codes */
 #define EPMD_DUMP_REQ 'd'

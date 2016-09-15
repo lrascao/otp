@@ -77,7 +77,9 @@
 
 	  %% New in kernel-5.1 (OTP 19.1):
 	  mf_setopts,        %% netkernel:setopts on active connection
-	  mf_getopts         %% netkernel:getopts on active connection
+	  mf_getopts,         %% netkernel:getopts on active connection
+
+	  connection_method = port_please
 }).
 	  
 

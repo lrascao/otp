@@ -36,7 +36,8 @@
 	 set_lock/1, set_lock/2, set_lock/3,
 	 del_lock/1, del_lock/2,
 	 trans/2, trans/3, trans/4,
-	 random_exit_name/3, random_notify_name/3, notify_all_name/3]).
+	 random_exit_name/3, random_notify_name/3, notify_all_name/3,
+   register_node_alias/2]).
 
 %% Internal exports
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -111,6 +112,7 @@ cs() ->
 		synced = []        :: [node()],
 		resolvers = [],
 		syncers = []       :: [pid()],
+    node_aliases = []  :: [{node(), node()}],
 		node_name = node() :: node(),
 		the_locker, the_registrar, trace,
                 global_lock_down = false :: boolean()
@@ -433,6 +435,11 @@ trans(Id, Fun, Nodes, Retries) ->
 info() ->
     gen_server:call(global_name_server, info, infinity).
 
+register_node_alias(NodeAlias, Node) ->
+    ?trace({register_node_alias, {NodeAlias, Node}}),
+    gen_server:cast(global_name_server,
+        {register_node_alias, NodeAlias, Node}).
+
 %%%-----------------------------------------------------------------
 %%% Call-back functions from gen_server
 %%%-----------------------------------------------------------------
@@ -664,9 +671,21 @@ handle_call(Request, From, S) ->
 
 -spec handle_cast(term(), state()) -> {'noreply', state()}.
 
-handle_cast({init_connect, Vsn, Node, InitMsg}, S) ->
+handle_cast({init_connect, Vsn, Node0, InitMsg}, S) ->
     %% Sent from global_name_server at Node.
-    ?trace({'####', init_connect, {vsn, Vsn}, {node,Node},{initmsg,InitMsg}}),
+    ?trace({'####', init_connect, {vsn, Vsn}, {node,Node0},{initmsg,InitMsg}}),
+    %% check for node aliases
+    Node = case proplists:get_value(Node0, S#state.node_aliases, undefined) of
+            undefined -> Node0;
+            Alias ->
+              ?trace({'####', init_connect, {alias_found, Alias, Node0}}),
+              %% get the remote locker pid
+              {locker, _NoLongerAPid, _HisKnown0, HisTheLocker} = InitMsg,
+               %% create an association between the node name we know about
+              %% and the name it knows itself by
+              erlang:setnodealias(Alias, Node0, HisTheLocker),
+              Alias
+           end,
     case Vsn of
 	%% It is always the responsibility of newer versions to understand
 	%% older versions of the protocol.
@@ -818,6 +837,12 @@ handle_cast({async_del_lock, _ResourceId, _Pid}, S) ->
     %% The DOWN message deletes the lock.
     %% R14A nodes and later do not send async_del_lock messages.
     {noreply, S};
+
+handle_cast({register_node_alias, NodeAlias, Node}, S) ->
+    ?trace({'####', register_node_alias, {NodeAlias, Node}}),
+    NewS = S#state{node_aliases = S#state.node_aliases ++
+                [{NodeAlias, Node}]},
+    {noreply, NewS};
 
 handle_cast(Request, S) ->
     error_logger:warning_msg("The global_name_server "
@@ -1571,7 +1596,8 @@ the_locker_message({his_the_locker, HisTheLocker, HisKnown0, _MyKnown}, S) ->
     {HisVsn, _HisKnown} = HisKnown0,
     true = HisVsn > 4,
     receive
-        {nodeup, Node, MyTag} when node(HisTheLocker) =:= Node ->
+        %% TODO: do a proper check for the correct node
+        {nodeup, Node, MyTag} ->
             ?trace({the_locker_nodeup, {node,Node},{mytag,MyTag}}),
             Him = #him{node = node(HisTheLocker), my_tag = MyTag,
                        locker = HisTheLocker, vsn = HisVsn},
