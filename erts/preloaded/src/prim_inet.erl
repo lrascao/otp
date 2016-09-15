@@ -31,8 +31,8 @@
 -export([connect/3, connect/4, async_connect/4]).
 -export([accept/1, accept/2, async_accept/2]).
 -export([shutdown/2]).
--export([send/2, send/3, sendto/4, sendmsg/3]).
--export([recv/2, recv/3, async_recv/3]).
+-export([send/2, send/3, sendto/4, sendmsg/3, send_fd/2]).
+-export([recv/2, recv/3, async_recv/3, recv_fd/1]).
 -export([unrecv/2]).
 -export([recvfrom/2, recvfrom/3]).
 -export([setopt/3, setopts/2, getopt/2, getopts/2, is_sockopt_val/2]).
@@ -498,6 +498,12 @@ sendmsg(S, #sctp_sndrcvinfo{}=SRI, Data) when is_port(S) ->
 	Reason -> {error,Reason}
     end.
 
+send_fd(S, Fd) when is_port(S) ->
+    case ctl_cmd(S, ?TCP_REQ_SENDFD, [?int32(Fd)]) of
+    {ok,[R1,R0]} -> {ok, ?u16(R1,R0)};
+    {error,_}=Error -> Error
+    end.
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%
 %% RECV(insock(), Length, [Timeout]) -> {ok,Data} | {error, Reason}
@@ -532,6 +538,18 @@ async_recv(S, Length, Time) ->
 	{ok,[R1,R0]} -> {ok, ?u16(R1,R0)};
 	{error,_}=Error -> Error
     end.	    
+
+recv_fd(S) when is_port(S) ->
+    case ctl_cmd(S, ?TCP_REQ_RECVFD, []) of
+        {ok,[R1,R0]} ->
+            Ref = ?u16(R1,R0),
+            receive
+                {inet_async, S, Ref, Status} -> Status;
+                {'EXIT', S, _Reason} ->
+                    {error, closed}
+            end;
+        {error,_}=Error -> Error
+    end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%

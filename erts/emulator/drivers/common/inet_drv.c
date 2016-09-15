@@ -68,6 +68,7 @@
 
 
 #include "erl_driver.h"
+#include "ancillary.h"
 
 /* The IS_SOCKET_ERROR macro below is used for portability reasons. While
    POSIX specifies that errors from socket-related system calls should be
@@ -709,6 +710,8 @@ static int is_nonzero(const char *s, size_t n)
 #define TCP_REQ_RECV           42
 #define TCP_REQ_UNRECV         43
 #define TCP_REQ_SHUTDOWN       44
+#define TCP_REQ_SENDFD         45
+#define TCP_REQ_RECVFD         46
 /* UDP and SCTP requests */
 #define PACKET_REQ_RECV        60 /* Common for UDP and SCTP         */
 /* #define SCTP_REQ_LISTEN       61 MERGED Different from TCP; not for UDP */
@@ -1243,6 +1246,7 @@ typedef struct {
     inet_async_multi_op *multi_first;/* NULL == no multi-accept-queue, op is in ordinary queue */
     inet_async_multi_op *multi_last;
     MultiTimerData *mtd;        /* Timer structures for multiple accept */
+    int is_ancillary;
 } tcp_descriptor;
 
 /* send function */
@@ -1250,6 +1254,9 @@ static int tcp_send(tcp_descriptor* desc, char* ptr, ErlDrvSizeT len);
 static int tcp_sendv(tcp_descriptor* desc, ErlIOVec* ev);
 static int tcp_recv(tcp_descriptor* desc, int request_len);
 static int tcp_deliver(tcp_descriptor* desc, int len);
+
+static int tcp_fd_send(tcp_descriptor* desc, int fd);
+static int tcp_fd_recv(tcp_descriptor* desc);
 
 static int tcp_shutdown_error(tcp_descriptor* desc, int err);
 
@@ -1520,6 +1527,8 @@ static void *realloc_wrapper(void *current, ErlDrvSizeT size){
 #   define LOAD_ASSOC_ID_CNT    LOAD_UINT_CNT
 #   define SCTP_ANC_BUFF_SIZE   INET_DEF_BUFFER/2 /* XXX: not very good... */
 #endif
+
+#   define IS_ANCILLARY(desc)((desc)->is_ancillary==1)
 
 #ifdef HAVE_UDP
 static int load_address(ErlDrvTermData* spec, int i, char* buf)
@@ -2116,6 +2125,32 @@ send_async_ok_port(ErlDrvTermData Port, int Ref,
 }
 
 /* send message:
+**      {inet_async, Port, Ref, {ok,Int}}
+*/
+static int
+send_async_ok_int(ErlDrvTermData Port, int Ref,
+        ErlDrvTermData recipient, int Arg)
+{
+    ErlDrvTermData spec[2*LOAD_ATOM_CNT + LOAD_PORT_CNT + 2*LOAD_INT_CNT +
+        2*LOAD_TUPLE_CNT];
+    int i = 0;
+
+    i = LOAD_ATOM(spec, i, am_inet_async);
+    i = LOAD_PORT(spec, i, Port);
+    i = LOAD_INT(spec, i, Ref);
+    i = LOAD_ATOM(spec, i, am_ok);
+    i = LOAD_INT(spec, i, Arg);
+    i = LOAD_TUPLE(spec, i, 2);
+    i = LOAD_TUPLE(spec, i, 4);
+    ASSERT(i == sizeof(spec)/sizeof(*spec));
+
+    DEBUGF(("send_async_ok_int(%ld): id %d, recipient %ld, arg: %d, # terms: %d\r\n",
+      (long)Port, Ref, recipient, Arg, i));
+
+    return erl_drv_send_term(Port, recipient, spec, i);
+}
+
+/* send message:
 **      {inet_async, Port, Ref, {error,Reason}}
 */
 static int
@@ -2161,6 +2196,17 @@ static int async_ok_port(inet_descriptor* desc, ErlDrvTermData Port2)
     if (deq_async(desc, &aid, &caller, &req) < 0)
 	return -1;
     return send_async_ok_port(desc->dport, aid, caller, Port2);
+}
+
+static int async_ok_int(inet_descriptor* desc, int Fd)
+{
+    int req;
+    int aid;
+    ErlDrvTermData caller;
+
+    if (deq_async(desc, &aid, &caller, &req) < 0)
+	return -1;
+    return send_async_ok_int(desc->dport, aid, caller, Fd);
 }
 
 static int async_error_am(inet_descriptor* desc, ErlDrvTermData reason)
@@ -9017,6 +9063,7 @@ static ErlDrvData prep_tcp_inet_start(ErlDrvPort port, char* args)
     desc->http_state = 0;
     desc->mtd = NULL;
     desc->multi_first = desc->multi_last = NULL;
+    desc->is_ancillary = 0;
     DEBUGF(("tcp_inet_start(%ld) }\r\n", (long)port));
     return (ErlDrvData) desc;
 }
@@ -9480,6 +9527,34 @@ static ErlDrvSSizeT tcp_inet_ctl(ErlDrvData e, unsigned int cmd,
 	    return ctl_reply(INET_REP_OK, NULL, 0, rbuf, rsize);
 	}
     }
+
+    case TCP_REQ_SENDFD: {
+      DEBUGF(("tcp_inet_ctl(%ld): SENDFD\r\n", (long)desc->inet.port)); 
+      return ctl_reply(INET_REP_OK, NULL, 0, rbuf, rsize);
+    }
+
+    case TCP_REQ_RECVFD: {
+      char tbuf[2];
+
+      DEBUGF(("tcp_inet_ctl(%ld): RECVFD\r\n", (long)desc->inet.port)); 
+
+      // a request to receive a socket was made, inform inet driver that this
+      // is an ancillary connection
+      desc->is_ancillary = 1;
+
+      if (enq_async(INETP(desc), tbuf, TCP_REQ_RECVFD) < 0)
+        return ctl_error(EALREADY, rbuf, rsize);
+
+      if (!INETP(desc)->is_ignored)
+        sock_select(INETP(desc),(FD_READ|FD_CLOSE),1);
+      else
+        INETP(desc)->is_ignored |= INET_IGNORE_READ;
+
+      DEBUGF(("tcp_inet_ctl(%ld): returned from select\r\n", (long)desc->inet.port));
+
+      return ctl_reply(INET_REP_OK, tbuf, 2, rbuf, rsize);
+      }
+
     default:
 	DEBUGF(("tcp_inet_ctl(%ld): %u\r\n", (long)desc->inet.port, cmd)); 
 	return inet_ctl(INETP(desc), cmd, buf, len, rbuf, rsize);
@@ -10008,6 +10083,28 @@ static int tcp_recv(tcp_descriptor* desc, int request_len)
     return 0;
 }
 
+static int tcp_fd_send(tcp_descriptor* desc, int fd) {
+    return 0;
+}
+
+static int tcp_fd_recv(tcp_descriptor* desc) {
+    int fd = -1;
+
+    DEBUGF(("tcp_fd_recv(%ld): s=%d\r\n",
+        (long)desc->inet.port, desc->inet.s));
+
+    if (ancil_recv_fd(desc->inet.s, &fd) < 0)
+      return tcp_recv_error(desc, EMSGSIZE);
+
+    DEBUGF(("tcp_fd_recv(%ld): s=%d, received descriptor=%d\r\n",
+        (long)desc->inet.port, desc->inet.s, fd));
+
+    async_ok_int(INETP(desc), fd);
+
+    sock_select(INETP(desc),(FD_READ|FD_CLOSE),0);
+
+    return 0;
+}
 
 #ifdef __WIN32__
 
@@ -10354,7 +10451,15 @@ static int tcp_inet_input(tcp_descriptor* desc, HANDLE event)
 	}
     }
     else if (IS_CONNECTED(INETP(desc))) {
-	ret = tcp_recv(desc, 0);
+      // Ancillary recv
+      if (IS_ANCILLARY(desc)) {
+        // unmark it as being ancillary since this is on a
+        // per-operation basis
+        desc->is_ancillary = 0;
+        ret = tcp_fd_recv(desc);
+      } else {
+	       ret = tcp_recv(desc, 0);
+      }
 	goto done;
     }
     else {

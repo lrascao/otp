@@ -100,6 +100,8 @@
 -define(TCP_REQ_RECV,           42).
 -define(TCP_REQ_UNRECV,         43).
 -define(TCP_REQ_SHUTDOWN,       44).
+-define(TCP_REQ_SENDFD,         45).
+-define(TCP_REQ_RECVFD,         46).
 %% UDP and SCTP requests
 -define(PACKET_REQ_RECV,        60).
 %%-define(SCTP_REQ_LISTEN,        61). MERGED
