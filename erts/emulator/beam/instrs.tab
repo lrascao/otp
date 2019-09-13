@@ -72,6 +72,7 @@ deallocate_return(Deallocate) {
 }
 
 move_deallocate_return(Src, Deallocate) {
+    DTRACE_RETURN_FROM_PC(c_p, I);
     x(0) = $Src;
     $deallocate_return($Deallocate);
 }
@@ -299,8 +300,8 @@ i_call_fun_last(Fun, Deallocate) {
 }
 
 return() {
+    DTRACE_RETURN_FROM_PC(c_p, I);
     SET_I(c_p->cp);
-    DTRACE_RETURN_FROM_PC(c_p);
 
     /*
      * We must clear the CP to make sure that a stale value do not
@@ -527,6 +528,7 @@ move_window5(S1, S2, S3, S4, S5, D) {
 
 move_return(Src) {
     //| -no_next
+    DTRACE_RETURN_FROM_PC(c_p, I);
     x(0) = $Src;
     SET_I(c_p->cp);
     c_p->cp = 0;
