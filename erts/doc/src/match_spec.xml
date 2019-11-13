@@ -136,6 +136,7 @@
       <item>ActionFunction ::= <c><![CDATA[set_seq_token]]></c> |
         <c><![CDATA[get_seq_token]]></c> | <c><![CDATA[message]]></c> |
         <c><![CDATA[return_trace]]></c> | <c><![CDATA[exception_trace]]></c> |
+        <c><![CDATA[process_backtrace]]></c> |
         <c><![CDATA[process_dump]]></c> | <c><![CDATA[enable_trace]]></c> |
         <c><![CDATA[disable_trace]]></c> | <c><![CDATA[trace]]></c> |
         <c><![CDATA[display]]></c> | <c><![CDATA[caller]]></c> |
@@ -320,7 +321,7 @@
           <p>As a special case, <c><![CDATA[{message, false}]]></c> disables
             sending of trace messages ('call' and 'return_to') for this function
             call, just like if the match specification had not matched.
-            This can be useful if only the side effects of 
+            This can be useful if only the side effects of
             the <c><![CDATA[MatchBody]]></c> part are desired.</p>
           <p>Another special case is <c><![CDATA[{message, true}]]></c>, which
             sets the default behavior, as if the function had no match
@@ -354,6 +355,12 @@
             because of an exception,
             an <c><![CDATA[exception_from]]></c> trace message is generated,
             regardless of the exception is caught or not.</p>
+        </item>
+        <tag><c>process_backtrace:</c></tag>
+        <item>
+          <p>Returns some textual information about the current process's stack
+            as a binary. Takes no arguments and is only allowed in the
+            <c><![CDATA[MatchBody]]></c> part when tracing.</p>
         </item>
         <tag><c>process_dump</c></tag>
         <item>
